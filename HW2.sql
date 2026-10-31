@@ -51,6 +51,43 @@ SET search_path TO hh_school;
 
 -- Вывод: Результат - 0 строк для обеих таблиц. Значит, все идентификаторы согласованы. vacancy_id в таблицах звонков и сообщений полностью соответствуют vacancy_id в откликах.
 
+-- ДОРАБОТКА (задание 1): дополнительные проверки согласованности идентификаторов.
+-- Сверяем employer_id события с работодателем вакансии, на которую оставлен отклик.
+
+-- Запрос 1:
+    SELECT COUNT(*) AS mismatched_employer_messages
+    FROM messages m
+    INNER JOIN responses r ON m.response_id = r.response_id
+    INNER JOIN vacancies v ON r.vacancy_id = v.vacancy_id
+    WHERE m.employer_id <> v.employer_id;
+-- Запрос 2:
+    SELECT COUNT(*) AS mismatched_employer_calls
+    FROM calls c
+    INNER JOIN responses r ON c.response_id = r.response_id
+    INNER JOIN vacancies v ON r.vacancy_id = v.vacancy_id
+    WHERE c.employer_id <> v.employer_id;
+
+-- Запрос 3:
+-- Проверяем, не расходится ли applicant_id у разных событий одного отклика.
+WITH applicants AS (
+    SELECT response_id, applicant_id FROM messages
+    UNION ALL
+    SELECT response_id, applicant_id FROM calls WHERE response_id IS NOT NULL
+)
+SELECT COUNT(*) AS responses_with_different_applicants
+FROM (
+    SELECT response_id
+    FROM applicants
+    GROUP BY response_id
+    HAVING COUNT(DISTINCT applicant_id) > 1
+) a;
+
+-- ДОРАБОТКА
+-- Проверил дополнительные связки идентификаторов.
+-- 1) mismatched_employer_messages: 0
+-- 2) mismatched_employer_calls: 0
+-- 3) responses_with_different_applicants: 0
+-- Противоречий нет.
 
 -- * Проверяем, может ли событие находиться в указанной точке времени относительно отклика;
 -- Работодатель физически не может позвонить или написать кандидату по отклику до того, как этот отклик был отправлен, поэтому call_at и sent_at должны быть строго больше created_at у response.
@@ -158,7 +195,8 @@ SET search_path TO hh_school;
 
 -- 2. ЕДИНЫЙ СЛОЙ КОММУНИКАЦИЙ  
 -- Запрос:
-    WITH event_messages AS (
+SET search_path TO hh_school;
+   WITH event_messages AS (
         SELECT 
             m.response_id,
             m.employer_id, 
@@ -167,7 +205,10 @@ SET search_path TO hh_school;
             'message' AS event_type
         FROM messages m
         INNER JOIN responses r ON m.response_id = r.response_id
-        WHERE m.sent_at <= r.created_at + INTERVAL '7 days'
+        -- ДОРАБОТКА: учитываем только коммуникации работодателя за первые 7 суток.
+        WHERE m.sender_role = 'employer'
+            AND m.sent_at >= r.created_at
+            AND m.sent_at < r.created_at + INTERVAL '7 days'
         
     ),
     event_calls AS (
@@ -179,7 +220,10 @@ SET search_path TO hh_school;
             'call' AS event_type
         FROM calls c
         INNER JOIN responses r ON c.response_id = r.response_id
-        WHERE c.call_at <= r.created_at + INTERVAL '7 days'
+        -- ДОРАБОТКА: учитываем только коммуникации работодателя за первые 7 суток.
+        WHERE c.caller_role = 'employer'
+            AND c.call_at >= r.created_at
+            AND c.call_at < r.created_at + INTERVAL '7 days'
     ),
     events AS (
         SELECT * FROM event_messages
@@ -194,11 +238,12 @@ SET search_path TO hh_school;
         count(event_type) FILTER (WHERE event_type = 'message') AS count_messages
     FROM events;
 
+-- ДОРАБОТКА:
 -- Вывод по единому слою коммуникаций за первые 7 дней:
--- 1) Общее количество событий: 2144
--- 2) Количество различных откликов с коммуникацией: 398
--- 3) Количество звонков: 168
--- 4) Количество сообщений: 1976
+-- 1) Общее количество событий: 1096
+-- 2) Количество различных откликов с коммуникацией: 382
+-- 3) Количество звонков: 108
+-- 4) Количество сообщений: 988
 
 -- Комментарий: 
 -- Можно заметить, что сообщения отправляются преимущественно чаще, чем совершаются звонки - это абсолютно логично, так как первичная связь от HR идёт в чате, где потом уже обсуждается время для разговорного интервью.
@@ -208,31 +253,62 @@ SET search_path TO hh_school;
 -- ШАГ 1: Слой уровня события
 -- Запрос:
 
-    SELECT 
+-- ДОРАБОТКА: повторно создаю единый слой событий,
+-- так как CTE из задания 2 недоступны в отдельном запросе.
+
+    WITH event_messages AS (
+        SELECT
+            m.response_id,
+            m.employer_id,
+            m.message_id AS event_id,
+            m.sent_at AS event_at,
+            'message' AS event_type
+        FROM messages m
+        INNER JOIN responses r ON m.response_id = r.response_id
+        WHERE m.sender_role = 'employer'
+            AND m.sent_at >= r.created_at
+            AND m.sent_at < r.created_at + INTERVAL '7 days'
+    ),
+    event_calls AS (
+        SELECT
+            c.response_id,
+            c.employer_id,
+            c.call_id AS event_id,
+            c.call_at AS event_at,
+            'call' AS event_type
+        FROM calls c
+        INNER JOIN responses r ON c.response_id = r.response_id
+        WHERE c.caller_role = 'employer'
+            AND c.call_at >= r.created_at
+            AND c.call_at < r.created_at + INTERVAL '7 days'
+    ),
+    events AS (
+        SELECT * FROM event_messages
+        UNION ALL
+        SELECT * FROM event_calls
+    )
+
+    SELECT
         response_id,
         employer_id,
         event_id,
         event_at,
         event_type,
-        
+
         ROW_NUMBER() OVER w AS event_number,
-        
         LAG(event_at) OVER w AS prev_event_time,
-        
         LEAD(event_type) OVER w AS next_event_type,
-        
         COUNT(event_id) OVER w AS count_events_to_date,
-        
         FIRST_VALUE(event_type) OVER w AS first_event_type,
 
         LAST_VALUE(event_type) OVER (
-            PARTITION BY response_id 
-            ORDER BY event_at, event_type, event_id 
+            PARTITION BY response_id
+            ORDER BY event_at, event_type, event_id
             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
         ) AS last_event_type
 
-FROM events
-WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id);
+    FROM events
+    WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id);
 
 -- Вывод:
 -- Теперь каждая коммуникация имеет свой контекст: её порядковый номер, что было до и после неё, а также с чего началось и чем закончилось общение по конкретному отклику. 
@@ -241,93 +317,101 @@ WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id);
 -- ШАГ 2: Витрина уровня отклика
 -- Запрос: 
 
-    WITH event_messages AS (
-        SELECT 
-            m.response_id,
-            m.employer_id,
-            m.message_id AS event_id,
-            m.sent_at AS event_at,
-            'message' AS event_type
-        FROM messages m
-        INNER JOIN responses r ON m.response_id = r.response_id
-        WHERE m.sent_at <= r.created_at + INTERVAL '7 days'
-    ),
-    event_calls AS (
-        SELECT 
-            c.response_id,
-            c.employer_id,
-            c.call_id AS event_id,
-            c.call_at AS event_at,
-            'call' AS event_type
-        FROM calls c
-        INNER JOIN responses r ON c.response_id = r.response_id
-        WHERE c.call_at <= r.created_at + INTERVAL '7 days'
-    ),
-    events AS (
-        SELECT * FROM event_messages
-        UNION ALL
-        SELECT * FROM event_calls
-    ),
-    timeline AS (
-        SELECT 
-            response_id,
-            employer_id,
-            event_id,
-            event_at,
-            event_type,
-            ROW_NUMBER() OVER w AS event_number,
-            LAG(event_at) OVER w AS prev_event_time,
-            LEAD(event_type) OVER w AS next_event_type,
-            COUNT(event_id) OVER w AS count_events_to_date,
-            FIRST_VALUE(event_type) OVER w AS first_event_type,
-            LAST_VALUE(event_type) OVER (
-                PARTITION BY response_id 
-                ORDER BY event_at, event_type, event_id 
-                ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-            ) AS last_event_type
-        FROM events
-        WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id)
-    ),
-    response_datamart AS (
-        SELECT 
-            r.response_id,
-            v.employer_id,
-            v.professional_role,
-            r.status AS response_status,
-            COUNT(t.event_id) AS count_events,
-            COUNT(t.event_id) FILTER (WHERE t.event_type = 'call') AS count_calls,
-            COUNT(t.event_id) FILTER (WHERE t.event_type = 'message') AS count_messages,
-            MIN(t.event_at) AS first_event_time,
-            MAX(t.first_event_type) AS first_event_type,
-            MAX(t.event_type) FILTER (WHERE t.event_number = 2) AS second_event_type,
-            MAX(t.last_event_type) AS last_event_type,
-            MIN(t.event_at) - r.created_at AS time_to_first_comm,
-            MAX(t.event_at - t.prev_event_time) AS max_interval
-        FROM responses r
-        INNER JOIN vacancies v ON r.vacancy_id = v.vacancy_id
-        LEFT JOIN timeline t ON r.response_id = t.response_id
-        GROUP BY 
-            r.response_id,
-            v.employer_id,
-            v.professional_role,
-            r.status,
-            r.created_at
-    )
-    SELECT 
-        COUNT(*) AS count_total_rows,
-        COUNT(*) FILTER (WHERE count_events > 0) AS count_with_comm,
-        COUNT(*) FILTER (WHERE count_events = 0) AS count_without_comm,
-        COUNT(*) FILTER (WHERE first_event_type = 'message') AS count_first_message,
-        COUNT(*) FILTER (WHERE first_event_type = 'call') AS count_first_call
-    FROM response_datamart;
+WITH event_messages AS (
+    SELECT
+        m.response_id,
+        m.employer_id,
+        m.message_id AS event_id,
+        m.sent_at AS event_at,
+        'message' AS event_type
+    FROM messages m
+    INNER JOIN responses r ON m.response_id = r.response_id
+    -- ДОРАБОТКА: учитываем только коммуникации работодателя за первые 7 суток.
+    WHERE m.sender_role = 'employer'
+        AND m.sent_at >= r.created_at
+        AND m.sent_at < r.created_at + INTERVAL '7 days'
+),
+event_calls AS (
+    SELECT
+        c.response_id,
+        c.employer_id,
+        c.call_id AS event_id,
+        c.call_at AS event_at,
+        'call' AS event_type
+    FROM calls c
+    INNER JOIN responses r ON c.response_id = r.response_id
+    -- ДОРАБОТКА: учитываем только коммуникации работодателя за первые 7 суток.
+    WHERE c.caller_role = 'employer'
+        AND c.call_at >= r.created_at
+        AND c.call_at < r.created_at + INTERVAL '7 days'
+),
+events AS (
+    SELECT * FROM event_messages
+    UNION ALL
+    SELECT * FROM event_calls
+),
+timeline AS (
+    SELECT
+        response_id,
+        employer_id,
+        event_id,
+        event_at,
+        event_type,
+        ROW_NUMBER() OVER w AS event_number,
+        LAG(event_at) OVER w AS prev_event_time,
+        LEAD(event_type) OVER w AS next_event_type,
+        COUNT(event_id) OVER w AS count_events_to_date,
+        FIRST_VALUE(event_type) OVER w AS first_event_type,
+        LAST_VALUE(event_type) OVER (
+            PARTITION BY response_id
+            ORDER BY event_at, event_type, event_id
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS last_event_type
+    FROM events
+    WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id)
+),
+response_datamart AS (
+    SELECT
+        r.response_id,
+        v.employer_id,
+        v.professional_role,
+        r.status AS response_status,
+        COUNT(t.event_id) AS count_events,
+        COUNT(t.event_id) FILTER (WHERE t.event_type = 'call') AS count_calls,
+        COUNT(t.event_id) FILTER (WHERE t.event_type = 'message') AS count_messages,
+        MIN(t.event_at) AS first_event_time,
+        MAX(t.first_event_type) AS first_event_type,
+        MAX(t.event_type) FILTER (WHERE t.event_number = 2) AS second_event_type,
+        MAX(t.last_event_type) AS last_event_type,
+        MIN(t.event_at) - r.created_at AS time_to_first_comm,
+        MAX(t.event_at - t.prev_event_time) AS max_interval
+    FROM responses r
+    INNER JOIN vacancies v ON r.vacancy_id = v.vacancy_id
+    LEFT JOIN timeline t ON r.response_id = t.response_id
+    GROUP BY
+        r.response_id,
+        v.employer_id,
+        v.professional_role,
+        r.status,
+        r.created_at
+)
 
+SELECT
+    COUNT(*) AS count_total_rows,
+    COUNT(*) FILTER (WHERE count_events > 0) AS count_with_comm,
+    COUNT(*) FILTER (WHERE count_events = 0) AS count_without_comm,
+    COUNT(*) FILTER (WHERE first_event_type = 'message') AS count_first_message,
+    COUNT(*) FILTER (WHERE first_event_type = 'call') AS count_first_call
+FROM response_datamart;
+
+-- ДОРАБОТКА:
 -- Вывод:
 -- 1. Общее количество строк (откликов) в витрине: 628
--- 2. Количество откликов с коммуникацией: 398
--- 3. Количество откликов без коммуникации: 230
--- 4. Количество откликов, где первой коммуникацией было сообщение: 303
--- 5. Количество откликов, где первой коммуникацией был звонок: 95
--- Статистика первых коммуникаций (303 сообщения против 95 звонков) подтверждает гипотезу из предыдущего блока: HR в подавляющем большинстве случаев предпочитают начинать коммуникацию с кандидатом через чат (в примерно 76% случаев).
+-- 2. Количество откликов с коммуникацией: 382
+-- 3. Количество откликов без коммуникации: 246
+-- 4. Количество откликов, где первой коммуникацией было сообщение: 314
+-- 5. Количество откликов, где первой коммуникацией был звонок: 68
+-- Статистика первых коммуникаций (314 сообщений против 68 звонков) подтверждает гипотезу из предыдущего блока: HR в подавляющем большинстве случаев предпочитают начинать коммуникацию с кандидатом через чат (в примерно 82% случаев).
 
 
 
@@ -337,117 +421,144 @@ WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id);
 
 -- 4. РЕЙТИНГ РАБОТОДАТЕЛЕЙ ВНУТРИ НАПРАВЛЕНИЯ
 -- Запрос:
-    WITH event_messages AS (
-        SELECT 
-            m.response_id,
-            m.employer_id,
-            m.message_id AS event_id,
-            m.sent_at AS event_at,
-            'message' AS event_type
-        FROM messages m
-        INNER JOIN responses r ON m.response_id = r.response_id
-        WHERE m.sent_at <= r.created_at + INTERVAL '7 days'
-    ),
-    event_calls AS (
-        SELECT 
-            c.response_id,
-            c.employer_id,
-            c.call_id AS event_id,
-            c.call_at AS event_at,
-            'call' AS event_type
-        FROM calls c
-        INNER JOIN responses r ON c.response_id = r.response_id
-        WHERE c.call_at <= r.created_at + INTERVAL '7 days'
-    ),
-    events AS (
-        SELECT * FROM event_messages
-        UNION ALL
-        SELECT * FROM event_calls
-    ),
-    timeline AS (
-        SELECT 
-            response_id,
-            employer_id,
-            event_id,
-            event_at,
-            event_type,
-            ROW_NUMBER() OVER w AS event_number,
-            LAG(event_at) OVER w AS prev_event_time,
-            LEAD(event_type) OVER w AS next_event_type,
-            COUNT(event_id) OVER w AS count_events_to_date,
-            FIRST_VALUE(event_type) OVER w AS first_event_type,
-            LAST_VALUE(event_type) OVER (
-                PARTITION BY response_id 
-                ORDER BY event_at, event_type, event_id 
-                ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-            ) AS last_event_type
-        FROM events
-        WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id)
-    ),
-    response_datamart AS (
-        SELECT 
-            r.response_id,
-            v.employer_id,
-            v.professional_role,
-            r.status AS response_status,
-            COUNT(t.event_id) AS count_events,
-            COUNT(t.event_id) FILTER (WHERE t.event_type = 'call') AS count_calls,
-            COUNT(t.event_id) FILTER (WHERE t.event_type = 'message') AS count_messages,
-            MIN(t.event_at) AS first_event_time,
-            MAX(t.first_event_type) AS first_event_type,
-            MAX(t.event_type) FILTER (WHERE t.event_number = 2) AS second_event_type,
-            MAX(t.last_event_type) AS last_event_type,
-            MIN(t.event_at) - r.created_at AS time_to_first_comm,
-            MAX(t.event_at - t.prev_event_time) AS max_interval
-        FROM responses r
-        INNER JOIN vacancies v ON r.vacancy_id = v.vacancy_id
-        LEFT JOIN timeline t ON r.response_id = t.response_id
-        GROUP BY 
-            r.response_id,
-            v.employer_id,
-            v.professional_role,
-            r.status,
-            r.created_at
-    ),
-    employer_stats AS (
-        SELECT 
-            professional_role,
-            employer_id,
-            COUNT(*) AS total_responses,
-            COUNT(*) FILTER (WHERE count_events > 0) AS count_with_comm,
-            ROUND(COUNT(*) FILTER (WHERE count_events > 0) * 100.0 / COUNT(*), 2) AS processed_percentage,
-            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY time_to_first_comm) AS median_time,
-            PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY time_to_first_comm) AS p90_time,
-            ROUND(COUNT(*) FILTER (WHERE response_status = 'invitation') * 100.0 / COUNT(*), 2) AS invitation_conversion
-        FROM response_datamart
-        GROUP BY professional_role, employer_id
-    ),
-    ranked_employers AS (
-        SELECT 
-            professional_role,
-            employer_id,
-            DENSE_RANK() OVER (
-                PARTITION BY professional_role 
-                ORDER BY processed_percentage DESC, median_time ASC
-            ) AS place
-        FROM employer_stats
-        WHERE total_responses >= 8
-    )
-    SELECT 
+WITH event_messages AS (
+    SELECT
+        m.response_id,
+        m.employer_id,
+        m.message_id AS event_id,
+        m.sent_at AS event_at,
+        'message' AS event_type
+    FROM messages m
+    INNER JOIN responses r ON m.response_id = r.response_id
+    -- ДОРАБОТКА: учитываем только коммуникации работодателя за первые 7 суток.
+    WHERE m.sender_role = 'employer'
+        AND m.sent_at >= r.created_at
+        AND m.sent_at < r.created_at + INTERVAL '7 days'
+),
+event_calls AS (
+    SELECT
+        c.response_id,
+        c.employer_id,
+        c.call_id AS event_id,
+        c.call_at AS event_at,
+        'call' AS event_type
+    FROM calls c
+    INNER JOIN responses r ON c.response_id = r.response_id
+    -- ДОРАБОТКА: учитываем только коммуникации работодателя за первые 7 суток.
+    WHERE c.caller_role = 'employer'
+        AND c.call_at >= r.created_at
+        AND c.call_at < r.created_at + INTERVAL '7 days'
+),
+events AS (
+    SELECT * FROM event_messages
+    UNION ALL
+    SELECT * FROM event_calls
+),
+timeline AS (
+    SELECT
+        response_id,
+        employer_id,
+        event_id,
+        event_at,
+        event_type,
+        ROW_NUMBER() OVER w AS event_number,
+        LAG(event_at) OVER w AS prev_event_time,
+        LEAD(event_type) OVER w AS next_event_type,
+        COUNT(event_id) OVER w AS count_events_to_date,
+        FIRST_VALUE(event_type) OVER w AS first_event_type,
+        LAST_VALUE(event_type) OVER (
+            PARTITION BY response_id
+            ORDER BY event_at, event_type, event_id
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS last_event_type
+    FROM events
+    WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id)
+),
+response_datamart AS (
+    SELECT
+        r.response_id,
+        v.employer_id,
+        v.professional_role,
+        r.status AS response_status,
+        COUNT(t.event_id) AS count_events,
+        COUNT(t.event_id) FILTER (WHERE t.event_type = 'call') AS count_calls,
+        COUNT(t.event_id) FILTER (WHERE t.event_type = 'message') AS count_messages,
+        MIN(t.event_at) AS first_event_time,
+        MAX(t.first_event_type) AS first_event_type,
+        MAX(t.event_type) FILTER (WHERE t.event_number = 2) AS second_event_type,
+        MAX(t.last_event_type) AS last_event_type,
+        MIN(t.event_at) - r.created_at AS time_to_first_comm,
+        MAX(t.event_at - t.prev_event_time) AS max_interval
+    FROM responses r
+    INNER JOIN vacancies v ON r.vacancy_id = v.vacancy_id
+    LEFT JOIN timeline t ON r.response_id = t.response_id
+    GROUP BY
+        r.response_id,
+        v.employer_id,
+        v.professional_role,
+        r.status,
+        r.created_at
+),
+employer_stats AS (
+    SELECT
         professional_role,
-        place,
-        employer_id
-    FROM ranked_employers
-    WHERE place <= 2
-    ORDER BY professional_role, place, employer_id;
+        employer_id,
+        COUNT(*) AS total_responses,
+        COUNT(*) FILTER (WHERE count_events > 0) AS count_with_comm,
+        ROUND(COUNT(*) FILTER (WHERE count_events > 0) * 100.0 / COUNT(*), 2) AS processed_percentage,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY time_to_first_comm) AS median_time,
+        PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY time_to_first_comm) AS p90_time,
+        -- ДОРАБОТКА: исправлен фактический статус приглашения.
+        ROUND(COUNT(*) FILTER (WHERE response_status = 'invited') * 100.0 / COUNT(*), 2) AS invitation_conversion
+    FROM response_datamart
+    GROUP BY professional_role, employer_id
+),
+ranked_employers AS (
+    SELECT
+        professional_role,
+        employer_id,
+        DENSE_RANK() OVER (
+            PARTITION BY professional_role
+            ORDER BY processed_percentage DESC, median_time ASC
+        ) AS place
+    FROM employer_stats
+    WHERE total_responses >= 8
+)
 
+SELECT
+    professional_role,
+    place,
+    employer_id
+FROM ranked_employers
+WHERE place <= 2
+ORDER BY professional_role, place, employer_id;
+
+-- ДОРАБОТКА: проверяем медиану первой коммуникации у работодателя 103.
+-- Запрос (на основе предыдущего, сохраняем все CTE, меняя только SELDCT)
+SELECT
+    professional_role,
+    employer_id,
+    total_responses,
+    count_with_comm,
+    processed_percentage,
+    median_time,
+    p90_time,
+    invitation_conversion
+FROM employer_stats
+WHERE employer_id = 103
+ORDER BY professional_role;
+
+-- ДОРАБОТКА:
+-- Уточнил вывод по работодателю 103 после проверки медианного времени до первой коммуникации.
 -- Вывод:
 -- Аналитик данных: 1 место - 109, 2 место - 103
 -- Дата-инженер: 1 место - 106, 2 место - 101
 -- Продуктовый аналитик: 1 место - 103, 2 место - 102
 -- Разработчик: 1 место - 112, 2 место - 104
 -- Тестировщик: 1 место - 107, 2 место - 108
--- Стоит отметить работодателя 103, который вошел в топ сразу по двум смежным направлениям («Аналитик данных» и «Продуктовый аналитик»). Это явный показатель того, что у компании выстроен процесс найма data-специалистов, а рекрутёры работают с этими кандидатами максимально оперативно.
+-- Стоит отметить работодателя 103, который вошел в топ сразу по двум смежным направлениям («Аналитик данных» и «Продуктовый аналитик»). 
+-- При этом медианное время до первого контакта составляет 2 дня 6 часов 20 минут и 2 дня 7 часов 55 минут соответственно.
+-- Несмотря на высокую долю обработанных откликов (84.81% и 70.97%), назвать работу рекрутёров максимально оперативной нельзя.
 
 -- 5. СКОРОСТЬ ОТВЕТА РАБОТОДАТЕЛЯ В ПЕРЕПИСКЕ
 -- Запрос:
@@ -484,6 +595,7 @@ WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id);
     SELECT 
         employer_id,
         COUNT(*) AS responses_count,
+        SUM(COUNT(*)) OVER () AS total_measured_responses, -- ДОРАБОТКА: общее количество найденных ответов
         AVG(response_time) AS avg_response_time,
         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY response_time) AS median_response_time,
         PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY response_time) AS p90_response_time
@@ -491,6 +603,8 @@ WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id);
     GROUP BY employer_id
     ORDER BY median_response_time ASC;
 
+-- ДОРАБОТКА: добавил недостающее контрольное значение.
+-- Общее количество измеренных ответов работодателей (total_measured_responses): 749
 -- Аналитический комментарий:
 -- Работодатель 107 формально лидирует (медиана ответа 03:56:00), однако его среднее время ответа составляет более 9 часов (09:22:27). Такой разрыв между медианой и средним указывает на сильные выбросы - часть кандидатов ждет ответа очень долго (90-й перцентиль почти 20 часов). 
 -- На самом деле отличный результат показывают работодатели 103 и 101: они обрабатывают огромный объём ответов (171 и 161 соответственно), при этом удерживают медиану на стабильном уровне около 4,5 часов. Это признак системно отработанного процесса найма.
@@ -817,8 +931,8 @@ WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id);
 -- 5. Количество откликов, где первая коммуникация - сообщение (count_first_message): invited - 43, other - 271.
 -- 6. Доля первых сообщений среди откликов с коммуникацией (first_message_percentage): invited - 79.63%, other - 82.62%.
 
--- Итог: гипотеза частично подтверждается. По приглашённым откликам работодатели начинают коммуникацию быстрее на 3.58 часа по медиане.
--- Однако доля откликов с коммуникацией у invited ниже на 2.49%., а доля первых сообщений ниже на 2.99%
+-- ДОРАБОТКА: гипотеза «данных недостаточно». По приглашённым откликам медиана первой коммуникации меньше на 3.58 часа, однако по этим данным явную связь с приглашением установить нельзя.
+-- Доля откликов с коммуникацией у invited ниже на 2.49%., а доля первых сообщений ниже на 2.99%
 -- Различия небольшие, явную связь между скоростью ответа и приглашением установить нельзя.
 
 
@@ -843,10 +957,11 @@ WINDOW w AS (PARTITION BY response_id ORDER BY event_at, event_type, event_id);
 
 -- 8: ИТОГ ИССЛЕДОВАНИЯ
 
+-- ДОРАБОТКА:
 -- Вывод:
--- 1) Всего проанализировано 628 откликов, из которых 398 (63.4%) имели хотя бы одну коммуникацию в первые 7 дней, а 230 (36.6%) остались без зафиксированного общения в этот период.
--- 2) Работодатели чаще используют переписку, чем звонки: в едином слое коммуникаций оказалось 1976 сообщений против 168 звонков, а первая коммуникация начиналась с сообщения в 303 случаях против 95 звонков.
--- 3) При этом скорость и качество обработки откликов различаются между работодателями: например, компании 103 и 101 обработали 171 и 161 ответа в переписке соответственно, удерживая медианное время ответа около 4.5 часа.
+-- 1) Всего проанализировано 628 откликов, из которых 382 (60.8%) имели хотя бы одну коммуникацию в первые 7 дней, а 246 (39.1%) остались без зафиксированного общения со стороны работодателя в этот период.
+-- 2) Работодатели чаще используют переписку, чем звонки: в едином слое коммуникаций оказалось 988 сообщений против 108 звонков, а первая коммуникация начиналась с сообщения в 314 случаях против 68 звонков.
+-- 3) Скорость первого контакта и скорость ответа в переписке различаются: работодатели 103 и 101 дали 171 и 161 измеренный ответ с медианой около 4.5 часа, однако у работодателя 103 медианное время до первого контакта превышает 2 суток. Это показывает, что быстрое продолжение диалога не обязательно означает быстрое начало общения, поэтому эти показатели стоит оценивать отдельно.
 -- 4) Дополнительно исследовал метаданные 988 сообщений работодателей: 628 отправлены через web и 360 через mobile_app, причём доля непрочитанных составила 8.28% и 10% соответственно.
 -- 5) Проверка первой гипотезы показала, что по приглашённым откликам работодатели начинают коммуникацию немного быстрее: медиана составляет 51.08 часа против 54.67 часа у остальных, то есть разница около 3.6 часа.
 -- 6) Однако более интенсивное общение не оказалось характерным для приглашённых: среднее количество коммуникаций составило 1.63 против 1.76, а доля откликов с использованием одновременно сообщений и звонков — 8.70% против 10.63%.
